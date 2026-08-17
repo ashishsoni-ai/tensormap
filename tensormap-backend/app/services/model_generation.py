@@ -36,18 +36,21 @@ def model_generation(model_params: dict) -> dict:
 
     nodes_by_id = {node["id"]: node for node in model_params["nodes"]}
 
+    input_nodes = [node for node in model_params["nodes"] if node["type"] == "custominput"]
+    if not input_nodes:
+        raise ValueError("Model has no input layer. Add an Input node to the canvas before training.")
+
     # BFS from input nodes to build Keras layers in topological order
     keras_tensors = {}
     visited = set()
     queue = []
 
-    for node in model_params["nodes"]:
-        if node["type"] == "custominput":
-            dims = [int(node["data"]["params"].get(f"dim-{i + 1}", 0) or 0) for i in range(3)]
-            dims = [d for d in dims if d != 0]
-            keras_tensors[node["id"]] = tf.keras.Input(shape=dims, name=node["id"])
-            visited.add(node["id"])
-            queue.append(node["id"])
+    for node in input_nodes:
+        dims = [int(node["data"]["params"].get(f"dim-{i + 1}", 0) or 0) for i in range(3)]
+        dims = [d for d in dims if d != 0]
+        keras_tensors[node["id"]] = tf.keras.Input(shape=dims, name=node["id"])
+        visited.add(node["id"])
+        queue.append(node["id"])
 
     while queue:
         current_id = queue.pop(0)
@@ -71,8 +74,42 @@ def model_generation(model_params: dict) -> dict:
             node = nodes_by_id[target_id]
             keras_tensors[target_id] = _build_layer(node, input_tensor)
 
-    inputs = [keras_tensors[n["id"]] for n in model_params["nodes"] if n["type"] == "custominput"]
-    output_ids = [n["id"] for n in model_params["nodes"] if n["id"] not in source_to_targets]
+    # Every node must be reachable from an input layer. Anything left unvisited is
+    # either an orphan the user forgot to wire up or part of a cycle -- the BFS never
+    # built a tensor for it, so the output lookup below would fail with a bare
+    # KeyError. Fail early and name the offending nodes so the user can find them.
+    unreachable = sorted(node_id for node_id in nodes_by_id if node_id not in visited)
+    if unreachable:
+        raise ValueError(
+            f"Model contains layers that are not connected to any input layer: {', '.join(unreachable)}. "
+            "Connect them to the graph or remove them from the canvas."
+        )
+
+    inputs = [keras_tensors[node["id"]] for node in input_nodes]
+
+    # A node with no outgoing edges is a model output -- except for input nodes, which
+    # are dangling rather than terminal. Treating them as outputs silently produced a
+    # malformed model whose input was also its output.
+    output_ids = [
+        node["id"]
+        for node in model_params["nodes"]
+        if node["id"] not in source_to_targets and node["type"] != "custominput"
+    ]
+    if not output_ids:
+        raise ValueError(
+            "Model has no output layer. Connect at least one layer downstream of an input node before training."
+        )
+
+    # Input nodes are seeded into `visited` before the BFS runs, so the reachability
+    # check above cannot catch a dangling one. Report it here rather than letting
+    # Keras fail later with an opaque "`inputs` not connected to `outputs`".
+    dangling_inputs = sorted(node["id"] for node in input_nodes if node["id"] not in source_to_targets)
+    if dangling_inputs:
+        raise ValueError(
+            f"Input layers are not connected to any other layer: {', '.join(dangling_inputs)}. "
+            "Connect them to the graph or remove them from the canvas."
+        )
+
     outputs = [keras_tensors[oid] for oid in output_ids]
 
     model = tf.keras.Model(inputs=inputs, outputs=outputs)

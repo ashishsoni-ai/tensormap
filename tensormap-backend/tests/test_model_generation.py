@@ -218,18 +218,14 @@ class TestModelGeneration:
         assert len(model.outputs) == 2
 
     def test_single_input_no_edges(self):
-        """A graph with only an input node and no edges may raise ValueError
-        (Keras 2) or produce a valid identity model (Keras 3)."""
+        """A graph with only an input node has no output layer and is rejected
+        with a clear message on every Keras version."""
         params = {
             "nodes": [_input_node("solo", [4])],
             "edges": [],
         }
-        try:
-            result = model_generation(params)
-            # Keras 3: succeeds — verify the result is still a valid dict
-            assert isinstance(result, dict)
-        except (ValueError, TypeError):
-            pass  # Keras 2: raises as expected
+        with pytest.raises(ValueError, match="no output layer"):
+            model_generation(params)
 
     def test_unknown_layer_type_raises_value_error(self):
         """An unsupported node type in the graph must propagate a ValueError."""
@@ -409,3 +405,158 @@ class TestDropoutInModelGeneration:
         }
         with pytest.raises(ValueError, match="Unknown node type"):
             model_generation(params)
+
+
+# ===================================================================
+# Tests for graph connectivity validation (issue #244)
+# ===================================================================
+
+
+class TestGraphConnectivityValidation:
+    """model_generation() must reject malformed graphs with a clear ValueError
+    instead of crashing with a bare KeyError or silently building a bad model."""
+
+    def test_orphan_node_raises_value_error_naming_the_node(self):
+        """
+        input → out      (dense "stray" left unconnected on the canvas)
+
+        The BFS never reaches "stray", so it previously fell through to the
+        output lookup and crashed with KeyError.
+        """
+        params = {
+            "nodes": [
+                _input_node("x", [10]),
+                _dense_node("out", 1, "sigmoid"),
+                _dense_node("stray", 8, "relu"),
+            ],
+            "edges": [_edge("x", "out")],
+        }
+        with pytest.raises(ValueError, match="not connected to any input layer") as exc_info:
+            model_generation(params)
+        assert "stray" in str(exc_info.value)
+
+    def test_orphan_node_does_not_raise_key_error(self):
+        """Regression guard: the failure mode must be ValueError, never KeyError."""
+        params = {
+            "nodes": [_input_node("x", [4]), _dense_node("out", 1), _flatten_node("orphan")],
+            "edges": [_edge("x", "out")],
+        }
+        with pytest.raises(ValueError):
+            model_generation(params)
+
+    def test_disconnected_input_and_dense_raises_value_error(self):
+        """The exact reproduction from the issue: an Input and a Dense node
+        placed on the canvas but never connected."""
+        params = {
+            "nodes": [_input_node("x", [10]), _dense_node("d", 32, "relu")],
+            "edges": [],
+        }
+        with pytest.raises(ValueError, match="not connected to any input layer") as exc_info:
+            model_generation(params)
+        assert "d" in str(exc_info.value)
+
+    def test_all_orphans_are_listed_in_the_error(self):
+        """Every unreachable node is named, so the user can fix them in one pass."""
+        params = {
+            "nodes": [
+                _input_node("x", [10]),
+                _dense_node("out", 1),
+                _dense_node("orphan_a", 4),
+                _dense_node("orphan_b", 4),
+            ],
+            "edges": [_edge("x", "out"), _edge("orphan_a", "orphan_b")],
+        }
+        with pytest.raises(ValueError) as exc_info:
+            model_generation(params)
+        message = str(exc_info.value)
+        assert "orphan_a" in message
+        assert "orphan_b" in message
+
+    def test_cycle_raises_value_error(self):
+        """Nodes in a cycle are never visited by the BFS and must be reported
+        rather than silently dropped from the model."""
+        params = {
+            "nodes": [
+                _input_node("x", [10]),
+                _dense_node("out", 1),
+                _dense_node("a", 4),
+                _dense_node("b", 4),
+            ],
+            "edges": [_edge("x", "out"), _edge("a", "b"), _edge("b", "a")],
+        }
+        with pytest.raises(ValueError, match="not connected to any input layer"):
+            model_generation(params)
+
+    def test_graph_with_no_input_node_raises_value_error(self):
+        """A graph without any custominput node has nothing to seed the BFS with."""
+        params = {
+            "nodes": [_dense_node("a", 8), _dense_node("b", 1)],
+            "edges": [_edge("a", "b")],
+        }
+        with pytest.raises(ValueError, match="no input layer"):
+            model_generation(params)
+
+    def test_empty_graph_raises_value_error(self):
+        with pytest.raises(ValueError, match="no input layer"):
+            model_generation({"nodes": [], "edges": []})
+
+    def test_dangling_input_node_is_not_treated_as_an_output(self):
+        """
+        in_used → out
+        in_dangling            (connected to nothing)
+
+        "in_dangling" has no outgoing edges, so it was previously collected as a
+        model output, producing a model whose input was also its output.
+        """
+        params = {
+            "nodes": [
+                _input_node("in_used", [10]),
+                _input_node("in_dangling", [5]),
+                _dense_node("out", 1, "sigmoid"),
+            ],
+            "edges": [_edge("in_used", "out")],
+        }
+        with pytest.raises(ValueError, match="Input layers are not connected") as exc_info:
+            model_generation(params)
+        assert "in_dangling" in str(exc_info.value)
+        assert "in_used" not in str(exc_info.value)
+
+    def test_input_only_graph_raises_no_output_layer(self):
+        """A lone input node is a dangling node, not a one-layer identity model."""
+        params = {
+            "nodes": [_input_node("solo", [4])],
+            "edges": [],
+        }
+        with pytest.raises(ValueError, match="no output layer"):
+            model_generation(params)
+
+    def test_valid_graph_still_builds_after_validation(self):
+        """The new guards must not reject well-formed graphs."""
+        params = {
+            "nodes": [
+                _input_node("x", [28, 28, 1]),
+                _flatten_node("f"),
+                _dense_node("h", 32, "relu"),
+                _dense_node("out", 10, "softmax"),
+            ],
+            "edges": [_edge("x", "f"), _edge("f", "h"), _edge("h", "out")],
+        }
+        result = model_generation(params)
+        model = tf.keras.models.model_from_json(json.dumps(result))
+        assert model.input_shape == (None, 28, 28, 1)
+        assert model.output_shape == (None, 10)
+
+    def test_multi_input_graph_still_builds_after_validation(self):
+        """Both inputs feed the output, so neither is flagged as unreachable."""
+        params = {
+            "nodes": [
+                _input_node("in1", [4]),
+                _input_node("in2", [6]),
+                _dense_node("out", 1, "sigmoid"),
+            ],
+            "edges": [_edge("in1", "out"), _edge("in2", "out")],
+        }
+        result = model_generation(params)
+        model = tf.keras.models.model_from_json(json.dumps(result))
+        assert len(model.inputs) == 2
+        assert len(model.outputs) == 1
