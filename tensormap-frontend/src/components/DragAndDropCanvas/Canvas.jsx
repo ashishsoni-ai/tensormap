@@ -43,6 +43,7 @@ import { trainingHistory as trainingHistoryAtom } from "../../shared/atoms";
 import ContextMenu from "./ContextMenu";
 import useUndoRedo from "../../hooks/useUndoRedo";
 import { useLayerRegistry, getLayerSpec } from "../../hooks/useLayerRegistry";
+import { LEGACY_TYPE_MAP, TYPE_ABBREVIATIONS } from "../../types/registry";
 
 const isMac =
   typeof navigator !== "undefined"
@@ -50,6 +51,13 @@ const isMac =
       ? navigator.userAgentData.platform.toLowerCase().includes("mac")
       : /Mac/i.test(navigator.platform)
     : false;
+
+// Every registry layer key must render through GenericLayerNode so models
+// saved with the layer key as their node type (e.g. "dense", "input") still
+// render correctly when reloaded from the backend.
+const registryNodeTypes = Object.fromEntries(
+  Object.keys(TYPE_ABBREVIATIONS).map((key) => [key, GenericLayerNode]),
+);
 
 const nodeTypes = {
   custominput: InputNode,
@@ -60,6 +68,7 @@ const nodeTypes = {
   custommaxpool: MaxPoolingNode,
   customglobalavgpool: GlobalAvgPoolNode,
   genericlayer: GenericLayerNode, // New registry-driven node
+  ...registryNodeTypes,
 };
 
 // Keys MUST match nodeTypes above. Add a description when adding a node type.
@@ -260,7 +269,14 @@ function Canvas() {
           id: node.id,
           type: node.type,
           position: node.position || { x: 100, y: i * 200 },
-          data: { label: `${node.type} node`, params: node.data?.params || {} },
+          data: {
+            label: `${node.type} node`,
+            // The saved node type is either a registry layer key ("dense") or a
+            // legacy custom type ("customdense"); normalize to the registry key
+            // so GenericLayerNode can look it up.
+            layerType: LEGACY_TYPE_MAP[node.type] || node.type,
+            params: node.data?.params || {},
+          },
         }));
 
         const loadedEdges = (graph.edges || []).map((edge) => ({
