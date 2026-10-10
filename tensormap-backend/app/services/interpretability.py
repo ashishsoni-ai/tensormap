@@ -462,36 +462,69 @@ class InterpretabilityService:
         if sentinel and sentinel.get("status") == "computing":
             return None  # Still computing → 202
 
+        if sentinel and sentinel.get("status") == "failed":
+            error_msg = sentinel.get("error", "Feature importance computation failed")
+            raise RuntimeError(error_msg)
+
         # Mark as computing
         self.cache.set_cached(job_id, "feature_importance_status", {"status": "computing"}, session)
 
-        # Fire background computation
-        asyncio.create_task(self._compute_and_cache_feature_importance(job_id, session))
+        # Fire background computation using isolated database session
+        asyncio.create_task(self._compute_and_cache_feature_importance(job_id))
         return None  # Will be 202
 
-    async def _compute_and_cache_feature_importance(self, job_id: str, session: Session) -> None:
+    async def _compute_and_cache_feature_importance(self, job_id: str, session: Session | None = None) -> None:
         """Background task that computes feature importance and caches the result.
+
+        Uses get_session() to ensure an isolated DB session with proper lifecycle
+        independent of the HTTP request thread.
 
         Args:
             job_id: Training job ID
-            session: Database session
+            session: Optional existing database session (for direct test execution)
         """
+        from app.database import get_session
+
+        if session is not None:
+            try:
+                result = await asyncio.to_thread(self._compute_feature_importance_sync, job_id, session)
+                self.cache.set_cached(job_id, "feature_importance", result, session)
+                # Clear the computing sentinel
+                self.cache.set_cached(job_id, "feature_importance_status", {"status": "completed"}, session)
+                logger.info(f"Feature importance computation completed for job {job_id}")
+            except Exception as e:
+                logger.exception(f"Feature importance computation failed for job {job_id}")
+                self.cache.set_cached(
+                    job_id,
+                    "feature_importance_status",
+                    {"status": "failed", "error": str(e)},
+                    session,
+                )
+            return
+
         try:
-            result = await asyncio.to_thread(self._compute_feature_importance_sync, job_id, session)
-            self.cache.set_cached(job_id, "feature_importance", result, session)
-            # Clear the computing sentinel
-            self.cache.set_cached(job_id, "feature_importance_status", {"status": "completed"}, session)
-            logger.info(f"Feature importance computation completed for job {job_id}")
-        except Exception:
+            with get_session() as sess:
+                result = await asyncio.to_thread(self._compute_feature_importance_sync, job_id, sess)
+                self.cache.set_cached(job_id, "feature_importance", result, sess)
+                # Clear the computing sentinel
+                self.cache.set_cached(job_id, "feature_importance_status", {"status": "completed"}, sess)
+                logger.info(f"Feature importance computation completed for job {job_id}")
+        except Exception as e:
             logger.exception(f"Feature importance computation failed for job {job_id}")
-            self.cache.set_cached(job_id, "feature_importance_status", {"status": "failed"}, session)
+            with get_session() as sess:
+                self.cache.set_cached(
+                    job_id,
+                    "feature_importance_status",
+                    {"status": "failed", "error": str(e)},
+                    sess,
+                )
 
     def _compute_feature_importance_sync(self, job_id: str, session: Session) -> dict:
         """Compute permutation feature importance (blocking).
 
         Guardrails:
         - Sample capped at min(1000, len(X_test))
-        - Feature count capped at 20 (top by variance)
+        - Feature count capped at 20 (top by importance)
 
         Args:
             job_id: Training job ID
@@ -502,13 +535,21 @@ class InterpretabilityService:
             n_samples_used, n_repeats, analysis_type
         """
         import tensorflow as tf
-        from sklearn.base import BaseEstimator, ClassifierMixin
+        from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
         from sklearn.inspection import permutation_importance
+
+        from app.models.ml import ModelBasic
+        from app.models.training_job import TrainingJob
+        from app.shared.enums import ProblemType
 
         model_path = EXPORTS_BASE / job_id / "model.keras"
         keras_model = tf.keras.models.load_model(model_path)
 
         X_test, y_test, feature_names = self._load_test_data_with_features(job_id, session)
+
+        job = session.get(TrainingJob, job_id)
+        model_record = session.get(ModelBasic, job.model_id) if job else None
+        is_regression = model_record is not None and model_record.model_type == ProblemType.REGRESSION
 
         # Guardrails
         MAX_SAMPLES = 1000
@@ -517,45 +558,78 @@ class InterpretabilityService:
         X_sample = X_test[:n_samples]
         y_sample = y_test[:n_samples]
 
-        if X_sample.shape[1] > MAX_FEATURES:
-            # Select top 20 features by variance
-            variances = np.var(X_sample, axis=0)
-            top_indices = np.argsort(variances)[-MAX_FEATURES:]
-            top_indices = np.sort(top_indices)  # Keep original order
-            X_sample = X_sample[:, top_indices]
-            feature_names = [feature_names[i] for i in top_indices]
+        if is_regression:
 
-        # Wrap Keras model in a sklearn-compatible estimator so
-        # permutation_importance can call .predict() and .score()
-        class _KerasEstimatorWrapper(BaseEstimator, ClassifierMixin):
-            """Minimal sklearn wrapper around a trained Keras model."""
+            class _KerasRegressorWrapper(BaseEstimator, RegressorMixin):
+                """Minimal sklearn wrapper around a trained Keras regression model."""
 
-            def __init__(self, model):
-                self.model = model
-                self.classes_ = np.unique(y_sample)
+                def __init__(self, model):
+                    self.model = model
 
-            def fit(self, X, y=None):
-                return self  # Already trained
+                def fit(self, X, y=None):
+                    return self
 
-            def predict(self, X):
-                preds = self.model.predict(X, verbose=0)
-                return np.argmax(preds, axis=1)
+                def predict(self, X):
+                    preds = self.model.predict(X, verbose=0)
+                    if preds.ndim == 2 and preds.shape[1] == 1:
+                        return preds.flatten()
+                    elif preds.ndim == 2:
+                        return preds[:, 0]
+                    return preds.flatten()
 
-        estimator = _KerasEstimatorWrapper(keras_model)
+            estimator = _KerasRegressorWrapper(keras_model)
+            scoring = "r2"
+            y_sample = y_sample.astype(float)
+        else:
 
+            class _KerasClassifierWrapper(BaseEstimator, ClassifierMixin):
+                """Minimal sklearn wrapper around a trained Keras classification model."""
+
+                def __init__(self, model):
+                    self.model = model
+                    self.classes_ = np.unique(y_sample)
+
+                def fit(self, X, y=None):
+                    return self
+
+                def predict(self, X):
+                    preds = self.model.predict(X, verbose=0)
+                    return np.argmax(preds, axis=1)
+
+            estimator = _KerasClassifierWrapper(keras_model)
+            scoring = "accuracy"
+
+        # NOTE: Do NOT slice X_sample columns before evaluating the Keras model!
+        # The neural network expects its full input tensor shape.
+        # Feature capping is applied to the output importances.
         result = permutation_importance(
             estimator,
             X_sample,
             y_sample,
             n_repeats=10,
             random_state=42,
-            scoring="accuracy",
+            scoring=scoring,
         )
 
+        importances_mean = np.nan_to_num(result.importances_mean)
+        importances_std = np.nan_to_num(result.importances_std)
+
+        if len(feature_names) > MAX_FEATURES:
+            # Select top MAX_FEATURES by importance
+            top_indices = np.argsort(importances_mean)[-MAX_FEATURES:][::-1]
+            selected_features = [feature_names[i] for i in top_indices]
+            selected_means = importances_mean[top_indices].tolist()
+            selected_stds = importances_std[top_indices].tolist()
+        else:
+            sorted_indices = np.argsort(importances_mean)[::-1]
+            selected_features = [feature_names[i] for i in sorted_indices]
+            selected_means = importances_mean[sorted_indices].tolist()
+            selected_stds = importances_std[sorted_indices].tolist()
+
         return {
-            "features": feature_names,
-            "importances_mean": result.importances_mean.tolist(),
-            "importances_std": result.importances_std.tolist(),
+            "features": selected_features,
+            "importances_mean": selected_means,
+            "importances_std": selected_stds,
             "analysis_type": "feature_importance",
             "n_samples_used": n_samples,
             "n_repeats": 10,

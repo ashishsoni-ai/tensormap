@@ -760,3 +760,134 @@ def test_residuals_endpoint_classification_job(db_session, export_dir):
     assert response.status_code == 400
     data = response.json()
     assert "only available for regression" in data["detail"].lower()
+
+
+# ------------------------------------------------------------------
+# Test 21: test_feature_importance_with_real_keras_model_more_than_20_features
+# ------------------------------------------------------------------
+
+
+@pytest.mark.slow
+def test_feature_importance_with_real_keras_model_more_than_20_features(db_session, export_dir):
+    """Real Keras model with 25 features evaluates without shape mismatch and returns 20 features."""
+    job_id, X_test, y_test, feature_names, model = create_test_training_job(
+        session=db_session,
+        export_dir=export_dir,
+        model_name=f"test_real_25feat_{uuid4().hex[:8]}",
+        num_features=25,
+        num_classes=3,
+        epochs=2,
+    )
+
+    service = InterpretabilityService()
+
+    with (
+        patch.object(
+            service,
+            "_load_test_data_with_features",
+            return_value=(X_test, y_test, feature_names),
+        ),
+        patch(
+            "app.services.interpretability.EXPORTS_BASE",
+            export_dir,
+        ),
+    ):
+        result = service._compute_feature_importance_sync(job_id, db_session)
+
+    assert len(result["features"]) == 20
+    assert len(result["importances_mean"]) == 20
+    assert len(result["importances_std"]) == 20
+    assert result["analysis_type"] == "feature_importance"
+
+
+# ------------------------------------------------------------------
+# Test 22: test_feature_importance_regression_model
+# ------------------------------------------------------------------
+
+
+@pytest.mark.slow
+def test_feature_importance_regression_model(db_session, export_dir):
+    """Regression model computes feature importance using r2 scoring without classification errors."""
+    import tensorflow as tf
+
+    num_features = 6
+    X_train = np.random.randn(100, num_features).astype(np.float32)
+    y_train = (X_train[:, 0] * 2.5 + X_train[:, 1] * 1.2 + np.random.randn(100) * 0.1).astype(np.float32)
+    X_test = np.random.randn(30, num_features).astype(np.float32)
+    y_test = (X_test[:, 0] * 2.5 + X_test[:, 1] * 1.2 + np.random.randn(30) * 0.1).astype(np.float32)
+    feature_names = [f"reg_feat_{i}" for i in range(num_features)]
+
+    reg_model = tf.keras.Sequential(
+        [
+            tf.keras.layers.Input(shape=(num_features,)),
+            tf.keras.layers.Dense(8, activation="relu"),
+            tf.keras.layers.Dense(1),
+        ]
+    )
+    reg_model.compile(optimizer="adam", loss="mse")
+    reg_model.fit(X_train, y_train, epochs=2, verbose=0)
+
+    model_record = ModelBasic(
+        model_name=f"test_reg_fi_{uuid4().hex[:8]}",
+        model_type=ProblemType.REGRESSION,
+        graph_ir={},
+    )
+    db_session.add(model_record)
+    db_session.commit()
+    db_session.refresh(model_record)
+
+    job_id = str(uuid4())
+    job = TrainingJob(
+        id=job_id,
+        model_id=model_record.id,
+        status=TrainingStatus.COMPLETED,
+        hyperparams={},
+        started_at=datetime.now(UTC),
+        completed_at=datetime.now(UTC),
+    )
+    db_session.add(job)
+    db_session.commit()
+
+    job_export_dir = export_dir / job_id
+    job_export_dir.mkdir(parents=True, exist_ok=True)
+    reg_model.save(str(job_export_dir / "model.keras"))
+
+    service = InterpretabilityService()
+
+    with (
+        patch.object(
+            service,
+            "_load_test_data_with_features",
+            return_value=(X_test, y_test, feature_names),
+        ),
+        patch(
+            "app.services.interpretability.EXPORTS_BASE",
+            export_dir,
+        ),
+    ):
+        result = service._compute_feature_importance_sync(job_id, db_session)
+
+    assert len(result["features"]) == num_features
+    assert len(result["importances_mean"]) == num_features
+    assert result["analysis_type"] == "feature_importance"
+
+
+# ------------------------------------------------------------------
+# Test 23: test_feature_importance_failed_status_returns_500
+# ------------------------------------------------------------------
+
+
+def test_feature_importance_failed_status_returns_500(trained_job, db_session):
+    """When background task failed, endpoint returns 500 and surfaces the error."""
+    job_id = trained_job["job_id"]
+    cache = AnalysisCache()
+    cache.set_cached(
+        job_id,
+        "feature_importance_status",
+        {"status": "failed", "error": "Disk read failure"},
+        db_session,
+    )
+
+    response = client.get(f"/api/v1/model/analysis/{job_id}/feature-importance")
+    assert response.status_code == 500
+    assert "Disk read failure" in response.json()["detail"]
